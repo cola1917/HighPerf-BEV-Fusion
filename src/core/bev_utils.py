@@ -1,6 +1,84 @@
 """Camera-to-BEV matrix/IPM utility functions."""
 
+from __future__ import annotations
 
-def project_to_bev(*args, **kwargs):
-    """Placeholder for IPM projection implementation."""
-    raise NotImplementedError("Implement camera-to-BEV projection logic.")
+import cv2
+import numpy as np
+
+from src.config import RESOLUTION, X_MIN, X_MAX, Y_MIN, Y_MAX, BEV_HEIGHT, BEV_WIDTH
+
+
+def build_bev_coordinate_grid() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build BEV 2D physical coordinate grid for projection.
+
+    Uses np.linspace to generate coordinate axes from X_MIN to X_MAX and Y_MIN to Y_MAX
+    with spacing controlled by RESOLUTION, then np.meshgrid to create a 500x500 grid.
+
+    Returns:
+        Tuple of (x_grid, y_grid, x_coords, y_coords) where:
+        - x_grid, y_grid: 2D arrays of shape (BEV_HEIGHT, BEV_WIDTH) representing 
+          the x and y coordinates of each point in the BEV image.
+        - x_coords, y_coords: 1D coordinate arrays used to build the grids.
+    """
+    x_coords = np.linspace(X_MIN, X_MAX, BEV_WIDTH)
+    y_coords = np.linspace(Y_MIN, Y_MAX, BEV_HEIGHT)
+    
+    x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing='xy')
+    
+    return x_grid, y_grid, x_coords, y_coords
+
+
+def project_frame_to_bev(
+    image: np.ndarray,
+    intrinsic: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> np.ndarray:
+    """Project a single camera frame to BEV space via Inverse Perspective Mapping (IPM).
+
+    Args:
+        image: Camera image array of shape (H_img, W_img, 3) in RGB or BGR.
+        intrinsic: 3x3 camera intrinsic matrix.
+        rotation: 3x3 rotation matrix (ego frame -> camera frame).
+        translation: 3D translation vector (ego frame -> camera frame).
+
+    Returns:
+        BEV image of shape (BEV_HEIGHT, BEV_WIDTH, 3) with projected pixels.
+    """
+    # 1. Get BEV grid physical coordinates (ego frame, Z=0 ground plane)
+    x_grid, y_grid, _, _ = build_bev_coordinate_grid()
+    z_grid = np.zeros_like(x_grid)
+
+    # 2. Stack and flatten for batch matrix operations (3, N)
+    points_ego = np.stack([x_grid.flatten(), y_grid.flatten(), z_grid.flatten()], axis=0)
+
+    # 3. Ego frame -> Camera frame (inverse extrinsic transformation)
+    # Formula: P_cam = R^T @ (P_ego - t)
+    # (R.T is the inverse of R for orthogonal rotation matrices)
+    points_cam = rotation.T @ (points_ego - translation.reshape(3, 1))
+
+    # 4. Filter points behind the camera (only Z > 0 are valid)
+    depth = points_cam[2, :]
+    mask = depth > 0.1
+
+    # 5. Camera frame -> Pixel frame (perspective projection)
+    points_pixel = intrinsic @ points_cam
+    u = points_pixel[0, :] / depth  # x in pixel coords
+    v = points_pixel[1, :] / depth  # y in pixel coords
+
+    u_int = np.round(u).astype(np.int32)
+    v_int = np.round(v).astype(np.int32)
+
+    # 6. Filter points outside image bounds
+    valid = mask & (u_int >= 0) & (u_int < image.shape[1]) & (v_int >= 0) & (v_int < image.shape[0])
+
+    # 7. Initialize BEV image and fill pixels
+    bev_img = np.zeros((BEV_HEIGHT, BEV_WIDTH, 3), dtype=np.uint8)
+
+    # Map valid camera pixels to BEV grid indices
+    bev_y, bev_x = np.unravel_index(np.where(valid)[0], x_grid.shape)
+    bev_img[bev_y, bev_x] = image[v_int[valid], u_int[valid]]
+
+    # 8. Flip Y axis: physical coords have +Y forward, image coords have +Y downward
+    return cv2.flip(bev_img, 0)
+
