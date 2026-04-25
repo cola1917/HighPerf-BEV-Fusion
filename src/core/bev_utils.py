@@ -21,7 +21,7 @@ def build_bev_coordinate_grid() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.
         - x_coords, y_coords: 1D coordinate arrays used to build the grids.
     """
     x_coords = np.linspace(X_MIN, X_MAX, BEV_WIDTH)
-    y_coords = np.linspace(Y_MIN, Y_MAX, BEV_HEIGHT)
+    y_coords = np.linspace(Y_MAX, Y_MIN, BEV_HEIGHT)
     
     x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing='xy')
     
@@ -78,6 +78,9 @@ def project_frame_to_bev(
     # Map valid camera pixels to BEV grid indices
     bev_y, bev_x = np.unravel_index(np.where(valid)[0], x_grid.shape)
     bev_img[bev_y, bev_x] = image[v_int[valid], u_int[valid]]
+
+    center_px = (BEV_WIDTH // 2, BEV_HEIGHT // 2)
+    cv2.circle(bev_img, center_px, 5, (0, 0, 255), -1)
 
     # 8. Flip Y axis: physical coords have +Y forward, image coords have +Y downward
     return cv2.flip(bev_img, 0)
