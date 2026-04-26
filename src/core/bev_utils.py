@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import numba
 
 from src.config import RESOLUTION, X_MIN, X_MAX, Y_MIN, Y_MAX, BEV_HEIGHT, BEV_WIDTH
 
@@ -26,6 +27,54 @@ def build_bev_coordinate_grid() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.
     x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing='xy')
     
     return x_grid, y_grid, x_coords, y_coords
+
+
+def build_bev_remap_lut(
+    intrinsic: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Precompute remap lookup tables for a single camera.
+
+    Returns:
+        u_map: BEV pixel -> source image u index
+        v_map: BEV pixel -> source image v index
+        mask: valid projection mask for BEV pixels
+    """
+    x_grid, y_grid, _, _ = build_bev_coordinate_grid()
+    z_grid = np.zeros_like(x_grid)
+
+    points_ego = np.stack([x_grid, y_grid, z_grid], axis=0).reshape(3, -1)
+    points_cam = rotation.T @ (points_ego - translation.reshape(3, 1))
+
+    depth = points_cam[2, :]
+    mask = depth > 0.1
+
+    points_pixel = intrinsic @ points_cam
+    u = points_pixel[0, :] / depth
+    v = points_pixel[1, :] / depth
+
+    u_map = np.round(u).astype(np.int32).reshape(BEV_HEIGHT, BEV_WIDTH)
+    v_map = np.round(v).astype(np.int32).reshape(BEV_HEIGHT, BEV_WIDTH)
+    mask = mask.reshape(BEV_HEIGHT, BEV_WIDTH)
+    return u_map, v_map, mask
+
+
+@numba.njit(parallel=True)
+def fast_remap_kernel(image, u_map, v_map, mask, bev_out):
+    """Numba-accelerated pixel remapping kernel for BEV projection."""
+    H, W, _ = image.shape
+    bh, bw = u_map.shape
+
+    for i in numba.prange(bh):
+        for j in range(bw):
+            if mask[i, j]:
+                u = int(u_map[i, j])
+                v = int(v_map[i, j])
+                if 0 <= u < W and 0 <= v < H:
+                    bev_out[i, j, 0] = image[v, u, 0]
+                    bev_out[i, j, 1] = image[v, u, 1]
+                    bev_out[i, j, 2] = image[v, u, 2]
 
 
 def project_frame_to_bev(
