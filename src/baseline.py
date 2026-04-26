@@ -23,6 +23,51 @@ from src.core.bev_utils import project_frame_to_bev
 from src.core.data_loader import NuscManager
 
 
+def _physical_to_bev_pixel(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Map physical XY coordinates to BEV pixel indices."""
+    x_idx = np.round((x - X_MIN) / RESOLUTION).astype(np.int32)
+    y_idx = np.round((y - Y_MIN) / RESOLUTION).astype(np.int32)
+    y_idx = (BEV_HEIGHT - 1) - y_idx
+    return x_idx, y_idx
+
+
+def _box_category_color(category_name: str) -> tuple[int, int, int]:
+    """Category-to-color mapping in BGR format."""
+    category = category_name.lower()
+    if "vehicle" in category:
+        return (255, 0, 0)  # blue
+    if "pedestrian" in category:
+        return (0, 255, 255)  # yellow
+    return (0, 200, 0)  # fallback green
+
+
+def overlay_bev_box_outlines(
+    bev_img: np.ndarray,
+    boxes: list[object],
+    alpha: float = 0.25,
+) -> np.ndarray:
+    """Draw BEV boxes with transparent interior and fully visible solid outlines."""
+    fill_overlay = np.zeros_like(bev_img)
+    outlined = bev_img.copy()
+
+    for box in boxes:
+        # Use bottom face corners to draw an oriented rectangle on BEV.
+        corners = box.bottom_corners()
+        x = corners[0, :]
+        y = corners[1, :]
+        x_idx, y_idx = _physical_to_bev_pixel(x, y)
+        polygon = np.stack([x_idx, y_idx], axis=1).astype(np.int32)
+
+        color = _box_category_color(getattr(box, "name", ""))
+        cv2.fillPoly(fill_overlay, [polygon], color=color)
+        cv2.polylines(outlined, [polygon], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+
+    blended = cv2.addWeighted(bev_img, 1.0, fill_overlay, alpha, 0.0)
+    line_mask = np.any(outlined != bev_img, axis=2)
+    blended[line_mask] = outlined[line_mask]
+    return blended
+
+
 def overlay_lidar_on_bev(bev_img: np.ndarray, lidar_points_xyz: np.ndarray) -> np.ndarray:
     """Overlay ego-frame lidar points onto BEV image.
 
@@ -118,19 +163,14 @@ def main() -> None:
     if total_bev is None:
         raise RuntimeError("No valid camera projection generated.")
 
-    # 5. Save fused camera-only result
-    output_path = "/app/output_total_bev.jpg"
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    cv2.imwrite(output_path, total_bev)
-    print(f"Saved fused BEV image to: {output_path}")
-
-    # 6. Read LIDAR_TOP point cloud (.bin) and overlay to BEV
+    # 5. Read LIDAR_TOP point cloud (.bin) and overlay to BEV
     lidar_token = first_sample["data"].get("LIDAR_TOP")
     if lidar_token is None:
         raise RuntimeError("LIDAR_TOP not found in sample data.")
 
-    lidar_path = nusc.get_sample_data_path(lidar_token)
+    lidar_path, lidar_boxes, _ = nusc.get_sample_data(lidar_token)
     print(f"Loading LIDAR_TOP points from: {lidar_path}")
+    print(f"Loaded lidar boxes: {len(lidar_boxes)}")
 
     # nuScenes lidar binary is float32 with 5 values per point: x, y, z, intensity, ring index.
     lidar_raw = np.fromfile(lidar_path, dtype=np.float32)
@@ -142,10 +182,12 @@ def main() -> None:
     print(f"Loaded lidar points: {lidar_xyz.shape[0]}")
 
     total_bev_with_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz)
+    total_bev_with_lidar = overlay_bev_box_outlines(total_bev_with_lidar, lidar_boxes, alpha=0.45)
 
-    output_overlay_path = "/app/output_total_bev_lidar.jpg"
-    cv2.imwrite(output_overlay_path, total_bev_with_lidar)
-    print(f"Saved BEV + LIDAR overlay image to: {output_overlay_path}")
+    output_final_path = "/app/output_total_bev_lidar_box.jpg"
+    os.makedirs(os.path.dirname(output_final_path), exist_ok=True)
+    cv2.imwrite(output_final_path, total_bev_with_lidar)
+    print(f"Saved final BEV (with LIDAR + BOX) to: {output_final_path}")
 
     print("Visual checks:")
     print("1) Curb/road edges should align with dense green lidar traces.")
