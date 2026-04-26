@@ -1,23 +1,81 @@
-"""V0 baseline: serial loop pipeline with all-camera BEV fusion."""
+"""V0 baseline: all-camera BEV fusion with LIDAR point cloud overlay."""
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import cv2
 import numpy as np
 
-from src.config import CAMERA_NAMES
+from src.config import (
+    BEV_HEIGHT,
+    BEV_WIDTH,
+    CAMERA_NAMES,
+    DATA_ROOT,
+    RESOLUTION,
+    VERSION,
+    X_MAX,
+    X_MIN,
+    Y_MAX,
+    Y_MIN,
+)
 from src.core.bev_utils import project_frame_to_bev
 from src.core.data_loader import NuscManager
 
 
+def overlay_lidar_on_bev(bev_img: np.ndarray, lidar_points_xyz: np.ndarray) -> np.ndarray:
+    """Overlay ego-frame lidar points onto BEV image.
+
+    Uses XY to map points into BEV pixels and colors points by Z height.
+    """
+    x = lidar_points_xyz[:, 0]
+    y = lidar_points_xyz[:, 1]
+    z = lidar_points_xyz[:, 2]
+
+    # Keep only points inside configured BEV physical range.
+    in_range = (x >= X_MIN) & (x <= X_MAX) & (y >= Y_MIN) & (y <= Y_MAX)
+    if not np.any(in_range):
+        return bev_img
+
+    x = x[in_range]
+    y = y[in_range]
+    z = z[in_range]
+
+    # Map physical XY to pixel grid. Y is flipped to keep +Y (front) at the top.
+    x_idx = np.round((x - X_MIN) / RESOLUTION).astype(np.int32)
+    y_idx = np.round((y - Y_MIN) / RESOLUTION).astype(np.int32)
+    y_idx = (BEV_HEIGHT - 1) - y_idx
+
+    valid = (x_idx >= 0) & (x_idx < BEV_WIDTH) & (y_idx >= 0) & (y_idx < BEV_HEIGHT)
+    if not np.any(valid):
+        return bev_img
+
+    x_idx = x_idx[valid]
+    y_idx = y_idx[valid]
+    z = z[valid]
+
+    # Height coloring: lower points darker green, higher points brighter yellow-green.
+    z_min, z_max = np.percentile(z, [5, 95])
+    z_norm = np.clip((z - z_min) / max(z_max - z_min, 1e-6), 0.0, 1.0)
+    point_colors = np.stack(
+        [
+            np.zeros_like(z_norm),
+            (120 + 135 * z_norm).astype(np.uint8),
+            (40 + 80 * z_norm).astype(np.uint8),
+        ],
+        axis=1,
+    )
+
+    bev_with_points = bev_img.copy()
+    bev_with_points[y_idx, x_idx] = point_colors
+    return bev_with_points
+
+
 def main() -> None:
-    """Load first sample, project all cameras to BEV, and save fused output."""
+    """Load first sample, fuse 6-camera BEV, overlay lidar points, and save outputs."""
     # 1. Initialize nuScenes manager
     print("Initializing NuscManager...")
-    nusc_manager = NuscManager(dataroot="/data/nuscenes", version="v1.0-mini")
+    nusc_manager = NuscManager(dataroot=DATA_ROOT, version=VERSION)
     nusc = nusc_manager.nusc
 
     # 2. Get first sample
@@ -60,11 +118,38 @@ def main() -> None:
     if total_bev is None:
         raise RuntimeError("No valid camera projection generated.")
 
-    # 5. Save fused result
+    # 5. Save fused camera-only result
     output_path = "/app/output_total_bev.jpg"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     cv2.imwrite(output_path, total_bev)
     print(f"Saved fused BEV image to: {output_path}")
+
+    # 6. Read LIDAR_TOP point cloud (.bin) and overlay to BEV
+    lidar_token = first_sample["data"].get("LIDAR_TOP")
+    if lidar_token is None:
+        raise RuntimeError("LIDAR_TOP not found in sample data.")
+
+    lidar_path = nusc.get_sample_data_path(lidar_token)
+    print(f"Loading LIDAR_TOP points from: {lidar_path}")
+
+    # nuScenes lidar binary is float32 with 5 values per point: x, y, z, intensity, ring index.
+    lidar_raw = np.fromfile(lidar_path, dtype=np.float32)
+    if lidar_raw.size == 0 or lidar_raw.size % 5 != 0:
+        raise RuntimeError(f"Unexpected lidar data format in file: {lidar_path}")
+
+    lidar_points = lidar_raw.reshape(-1, 5)
+    lidar_xyz = lidar_points[:, :3]
+    print(f"Loaded lidar points: {lidar_xyz.shape[0]}")
+
+    total_bev_with_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz)
+
+    output_overlay_path = "/app/output_total_bev_lidar.jpg"
+    cv2.imwrite(output_overlay_path, total_bev_with_lidar)
+    print(f"Saved BEV + LIDAR overlay image to: {output_overlay_path}")
+
+    print("Visual checks:")
+    print("1) Curb/road edges should align with dense green lidar traces.")
+    print("2) Building wall regions should look like line-shaped point clusters in BEV.")
 
 
 if __name__ == "__main__":
