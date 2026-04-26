@@ -19,6 +19,11 @@ env/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
+cache/
+*.cache
+*.npz
+*.npy
 .coverage
 coverage.xml
 htmlcov/
