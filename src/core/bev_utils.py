@@ -21,7 +21,7 @@ def build_bev_coordinate_grid() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.
         - x_coords, y_coords: 1D coordinate arrays used to build the grids.
     """
     x_coords = np.linspace(X_MIN, X_MAX, BEV_WIDTH)
-    y_coords = np.linspace(Y_MAX, Y_MIN, BEV_HEIGHT)
+    y_coords = np.linspace(Y_MIN, Y_MAX, BEV_HEIGHT)
     
     x_grid, y_grid = np.meshgrid(x_coords, y_coords, indexing='xy')
     
