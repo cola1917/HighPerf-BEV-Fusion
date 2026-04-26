@@ -1,4 +1,4 @@
-"""Performance benchmark comparing baseline, concurrent, and ultimate engines."""
+"""Performance benchmark comparing baseline, concurrent, ultimate, and production engines."""
 
 from __future__ import annotations
 
@@ -19,6 +19,13 @@ from src.baseline import overlay_bev_box_outlines, overlay_lidar_on_bev
 from src.config import BEV_HEIGHT, BEV_WIDTH, CAMERA_NAMES, DATA_ROOT, RESOLUTION, VERSION, X_MAX, X_MIN, Y_MAX, Y_MIN
 from src.core.bev_utils import build_bev_remap_lut, fast_remap_kernel, project_frame_to_bev
 from src.core.data_loader import NuscManager
+from src.production_engine import (
+    _load_or_build_luts as _load_or_build_luts_production,
+    _overlay_boxes_on_bev,
+    _overlay_points_numba,
+    _prepare_current_lidar_and_boxes,
+    _worker_remap_to_shared_turbo,
+)
 from src.ultimate_engine import _load_or_build_luts, _worker_remap_to_shared
 
 
@@ -210,7 +217,7 @@ def _print_mode_summary(result: ModeResult) -> None:
     print(f"Compute Total    : {compute_total_ms:.3f} ms")
     print(f"IO Share         : {io_ratio:.2f}%")
     print(f"Compute Share    : {compute_ratio:.2f}%")
-    if result.mode == "ultimate":
+    if result.mode in ("ultimate", "production"):
         print(f"LUT Cache Hits   : {result.cache_hits}")
         print(f"LUT Cache Misses : {result.cache_misses}")
         print(f"LUT Elapsed      : {result.lut_elapsed_ns / 1e6:.3f} ms")
@@ -314,6 +321,55 @@ def _warmup_ultimate(nusc_manager: NuscManager, nusc: Any, sample_tokens: list[s
                 shm.unlink()
             overlay_data = _load_overlay_data(nusc, sample_token)
             del overlay_data
+            gc.collect()
+
+
+def _warmup_production(nusc_manager: NuscManager, nusc: Any, sample_tokens: list[str]) -> None:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for sample_token in sample_tokens:
+            frame_jobs = _load_frame_jobs(nusc_manager, sample_token)
+            luts, _, _ = _load_or_build_luts_production(
+                {
+                    job.camera_name: {
+                        "path": job.image_path,
+                        "intrinsic": job.intrinsic,
+                        "rotation": job.rotation,
+                        "translation": job.translation,
+                    }
+                    for job in frame_jobs.camera_jobs
+                }
+            )
+
+            shm_size = 6 * BEV_HEIGHT * BEV_WIDTH * 3 * np.dtype(np.uint8).itemsize
+            shm = shared_memory.SharedMemory(create=True, size=shm_size)
+            try:
+                shared_array = np.ndarray((6, BEV_HEIGHT, BEV_WIDTH, 3), dtype=np.uint8, buffer=shm.buf)
+                shared_array.fill(0)
+                futures = []
+                for job in frame_jobs.camera_jobs:
+                    lut_data = luts.get(job.camera_name)
+                    if lut_data is None:
+                        continue
+                    futures.append(
+                        executor.submit(
+                            _worker_remap_to_shared_turbo,
+                            job.camera_name,
+                            job.image_path,
+                            lut_data["u_map"],
+                            lut_data["v_map"],
+                            lut_data["mask"],
+                            job.camera_index,
+                            shm.name,
+                        )
+                    )
+                for future in as_completed(futures):
+                    future.result()
+                del shared_array
+            finally:
+                shm.close()
+                shm.unlink()
+
+            _prepare_current_lidar_and_boxes(nusc, sample_token)
             gc.collect()
 
 
@@ -535,6 +591,91 @@ def _run_ultimate_frame(
         shm.unlink()
 
 
+def _run_production_frame(
+    nusc: Any,
+    frame_jobs: FrameJobs,
+    executor: ProcessPoolExecutor,
+) -> tuple[FrameStat, np.ndarray | None, tuple[int, int, int]]:
+    frame_start = time.perf_counter_ns()
+    frame_data = {
+        job.camera_name: {
+            "path": job.image_path,
+            "intrinsic": job.intrinsic,
+            "rotation": job.rotation,
+            "translation": job.translation,
+        }
+        for job in frame_jobs.camera_jobs
+    }
+
+    prep_start = time.perf_counter_ns()
+    luts, cache_stats, lut_elapsed_ns = _load_or_build_luts_production(frame_data)
+    prep_ns = time.perf_counter_ns() - prep_start
+
+    shm_size = 6 * BEV_HEIGHT * BEV_WIDTH * 3 * np.dtype(np.uint8).itemsize
+    shm = shared_memory.SharedMemory(create=True, size=shm_size)
+    io_ns = 0
+    compute_ns = 0
+    total_bev: np.ndarray | None = None
+    try:
+        shared_array = np.ndarray((6, BEV_HEIGHT, BEV_WIDTH, 3), dtype=np.uint8, buffer=shm.buf)
+        shared_array.fill(0)
+
+        futures = []
+        for job in frame_jobs.camera_jobs:
+            lut_data = luts.get(job.camera_name)
+            if lut_data is None:
+                continue
+            futures.append(
+                executor.submit(
+                    _worker_remap_to_shared_turbo,
+                    job.camera_name,
+                    job.image_path,
+                    lut_data["u_map"],
+                    lut_data["v_map"],
+                    lut_data["mask"],
+                    job.camera_index,
+                    shm.name,
+                )
+            )
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result is None:
+                continue
+            _, io_cost, compute_cost = result
+            io_ns += io_cost
+            compute_ns += compute_cost
+
+        fuse_start = time.perf_counter_ns()
+        total_bev = np.max(shared_array, axis=0)
+        total_bev = cv2.flip(total_bev, 0)
+        compute_ns += time.perf_counter_ns() - fuse_start
+
+        lidar_start = time.perf_counter_ns()
+        cur_lidar, boxes, lidar_io_ns = _prepare_current_lidar_and_boxes(nusc, frame_jobs.sample_token)
+        io_ns += lidar_io_ns
+
+        if total_bev is not None:
+            _overlay_points_numba(total_bev, cur_lidar, (0, 255, 120))
+            total_bev = _overlay_boxes_on_bev(total_bev, boxes, alpha=0.22)
+        compute_ns += time.perf_counter_ns() - lidar_start
+
+        stat = FrameStat(
+            frame_index=-1,
+            latency_ns=time.perf_counter_ns() - frame_start,
+            io_ns=io_ns,
+            compute_ns=compute_ns,
+            prep_ns=prep_ns,
+            fuse_ns=0,
+        )
+        del shared_array
+        gc.collect()
+        return stat, total_bev, (cache_stats["hit"], cache_stats["miss"], lut_elapsed_ns)
+    finally:
+        shm.close()
+        shm.unlink()
+
+
 def _run_mode(
     mode: str,
     nusc_manager: NuscManager,
@@ -583,6 +724,30 @@ def _run_mode(
             for frame_index, token in enumerate(bench_tokens, start=1):
                 frame_jobs = _load_frame_jobs(nusc_manager, token)
                 stat, _, cache_info = _run_ultimate_frame(nusc, frame_jobs, executor)
+                stat.frame_index = frame_index
+                frame_stats.append(stat)
+                cache_hits += cache_info[0]
+                cache_misses += cache_info[1]
+                lut_elapsed_ns_total += cache_info[2]
+                print(f"Frame {frame_index:03d}: {stat.latency_ns / 1e6:.3f} ms")
+        return ModeResult(
+            mode=mode,
+            frame_stats=frame_stats,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            lut_elapsed_ns=lut_elapsed_ns_total,
+        )
+
+    if mode == "production":
+        _warmup_production(nusc_manager, nusc, warmup_tokens)
+        frame_stats = []
+        cache_hits = 0
+        cache_misses = 0
+        lut_elapsed_ns_total = 0
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for frame_index, token in enumerate(bench_tokens, start=1):
+                frame_jobs = _load_frame_jobs(nusc_manager, token)
+                stat, _, cache_info = _run_production_frame(nusc, frame_jobs, executor)
                 stat.frame_index = frame_index
                 frame_stats.append(stat)
                 cache_hits += cache_info[0]
@@ -653,8 +818,13 @@ def _print_comparison_table(results: list[ModeResult]) -> None:
 
     print("\nCache / prep details:")
     for result in results:
-        if result.mode == "ultimate":
-            print(f"ultimate: cache_hits={result.cache_hits}, cache_misses={result.cache_misses}, lut_elapsed_ms={result.lut_elapsed_ns / 1e6:.3f}")
+        if result.mode in ("ultimate", "production"):
+            print(
+                f"{result.mode}: "
+                f"cache_hits={result.cache_hits}, "
+                f"cache_misses={result.cache_misses}, "
+                f"lut_elapsed_ms={result.lut_elapsed_ns / 1e6:.3f}"
+            )
 
 
 def main() -> None:
@@ -672,7 +842,7 @@ def main() -> None:
     print(f"Benchmark frames : {min(BENCHMARK_FRAMES, max(0, len(sample_tokens) - WARMUP_FRAMES))}")
 
     results = []
-    for mode in ("baseline", "concurrent", "ultimate"):
+    for mode in ("baseline", "concurrent", "ultimate", "production"):
         result = _run_mode(mode, nusc_manager, nusc, sample_tokens)
         _print_mode_summary(result)
         results.append(result)
