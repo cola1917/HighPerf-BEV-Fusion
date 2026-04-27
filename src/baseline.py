@@ -19,16 +19,9 @@ from src.config import (
     Y_MAX,
     Y_MIN,
 )
-from src.core.bev_utils import project_frame_to_bev
+from src.core.bev_utils import physical_to_bev_pixel, project_frame_to_bev_with_mask
 from src.core.data_loader import NuscManager
-
-
-def _physical_to_bev_pixel(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Map physical XY coordinates to BEV pixel indices."""
-    x_idx = np.round((x - X_MIN) / RESOLUTION).astype(np.int32)
-    y_idx = np.round((y - Y_MIN) / RESOLUTION).astype(np.int32)
-    y_idx = (BEV_HEIGHT - 1) - y_idx
-    return x_idx, y_idx
+from src.core.sensor_alignment import load_current_lidar_and_boxes_ego
 
 
 def _box_category_color(category_name: str) -> tuple[int, int, int]:
@@ -55,7 +48,7 @@ def overlay_bev_box_outlines(
         corners = box.bottom_corners()
         x = corners[0, :]
         y = corners[1, :]
-        x_idx, y_idx = _physical_to_bev_pixel(x, y)
+        x_idx, y_idx = physical_to_bev_pixel(x, y)
         polygon = np.stack([x_idx, y_idx], axis=1).astype(np.int32)
 
         color = _box_category_color(getattr(box, "name", ""))
@@ -87,9 +80,7 @@ def overlay_lidar_on_bev(bev_img: np.ndarray, lidar_points_xyz: np.ndarray) -> n
     z = z[in_range]
 
     # Map physical XY to pixel grid. Y is flipped to keep +Y (front) at the top.
-    x_idx = np.round((x - X_MIN) / RESOLUTION).astype(np.int32)
-    y_idx = np.round((y - Y_MIN) / RESOLUTION).astype(np.int32)
-    y_idx = (BEV_HEIGHT - 1) - y_idx
+    x_idx, y_idx = physical_to_bev_pixel(x, y)
 
     valid = (x_idx >= 0) & (x_idx < BEV_WIDTH) & (y_idx >= 0) & (y_idx < BEV_HEIGHT)
     if not np.any(valid):
@@ -132,7 +123,8 @@ def main() -> None:
     frame_data = nusc_manager.get_frame_data(sample_token)
 
     # 4. Loop over all configured cameras and fuse into one total BEV
-    total_bev: np.ndarray | None = None
+    bev_sum: np.ndarray | None = None
+    bev_count: np.ndarray | None = None
 
     for camera_name in CAMERA_NAMES:
         if camera_name not in frame_data:
@@ -148,40 +140,41 @@ def main() -> None:
             print(f"Skip {camera_name}: failed to load image")
             continue
 
-        bev_img = project_frame_to_bev(
+        bev_img, valid_mask = project_frame_to_bev_with_mask(
             image=image,
             intrinsic=cam_data["intrinsic"],
             rotation=cam_data["rotation"],
             translation=cam_data["translation"],
         )
 
-        if total_bev is None:
-            total_bev = bev_img
-        else:
-            total_bev = np.maximum(total_bev, bev_img)
+        if bev_sum is None:
+            bev_sum = np.zeros_like(bev_img, dtype=np.float32)
+            bev_count = np.zeros((BEV_HEIGHT, BEV_WIDTH), dtype=np.uint16)
 
-    if total_bev is None:
+        bev_sum[valid_mask] += bev_img.astype(np.float32)[valid_mask]
+        bev_count[valid_mask] += 1
+
+    if bev_sum is None or bev_count is None:
         raise RuntimeError("No valid camera projection generated.")
+
+    total_bev = np.zeros((BEV_HEIGHT, BEV_WIDTH, 3), dtype=np.uint8)
+    nonzero = bev_count > 0
+    if np.any(nonzero):
+        total_bev[nonzero] = (bev_sum[nonzero] / bev_count[nonzero, None]).astype(np.uint8)
 
     # 5. Read LIDAR_TOP point cloud (.bin) and overlay to BEV
     lidar_token = first_sample["data"].get("LIDAR_TOP")
     if lidar_token is None:
         raise RuntimeError("LIDAR_TOP not found in sample data.")
 
-    lidar_path, lidar_boxes, _ = nusc.get_sample_data(lidar_token)
+    lidar_path = nusc.get_sample_data_path(lidar_token)
     print(f"Loading LIDAR_TOP points from: {lidar_path}")
+
+    lidar_xyz_ego, lidar_boxes, _ = load_current_lidar_and_boxes_ego(nusc, sample_token)
     print(f"Loaded lidar boxes: {len(lidar_boxes)}")
+    print(f"Loaded lidar points: {lidar_xyz_ego.shape[0]}")
 
-    # nuScenes lidar binary is float32 with 5 values per point: x, y, z, intensity, ring index.
-    lidar_raw = np.fromfile(lidar_path, dtype=np.float32)
-    if lidar_raw.size == 0 or lidar_raw.size % 5 != 0:
-        raise RuntimeError(f"Unexpected lidar data format in file: {lidar_path}")
-
-    lidar_points = lidar_raw.reshape(-1, 5)
-    lidar_xyz = lidar_points[:, :3]
-    print(f"Loaded lidar points: {lidar_xyz.shape[0]}")
-
-    total_bev_with_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz)
+    total_bev_with_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz_ego)
     total_bev_with_lidar = overlay_bev_box_outlines(total_bev_with_lidar, lidar_boxes, alpha=0.45)
 
     output_final_path = "/app/output_total_bev_lidar_box.jpg"

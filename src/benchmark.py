@@ -19,6 +19,7 @@ from src.baseline import overlay_bev_box_outlines, overlay_lidar_on_bev
 from src.config import BEV_HEIGHT, BEV_WIDTH, CAMERA_NAMES, DATA_ROOT, RESOLUTION, VERSION, X_MAX, X_MIN, Y_MAX, Y_MIN
 from src.core.bev_utils import build_bev_remap_lut, fast_remap_kernel, project_frame_to_bev
 from src.core.data_loader import NuscManager
+from src.core.sensor_alignment import load_current_lidar_and_boxes_ego
 from src.production_engine import (
     _load_or_build_luts as _load_or_build_luts_production,
     _overlay_boxes_on_bev,
@@ -155,22 +156,9 @@ def _load_frame_jobs(nusc_manager: NuscManager, sample_token: str) -> FrameJobs:
 
 
 def _load_overlay_data(nusc: Any, sample_token: str) -> FrameOverlayData:
-    sample = nusc.get("sample", sample_token)
-    lidar_token = sample["data"].get("LIDAR_TOP")
-    if lidar_token is None:
-        return FrameOverlayData(lidar_xyz=None, lidar_boxes=[], io_ns=0)
-
-    io_start = time.perf_counter_ns()
-    lidar_path, lidar_boxes, _ = nusc.get_sample_data(lidar_token)
-    lidar_raw = np.fromfile(lidar_path, dtype=np.float32)
-    io_ns = time.perf_counter_ns() - io_start
-
-    lidar_xyz = None
-    if lidar_raw.size != 0 and lidar_raw.size % 5 == 0:
-        lidar_xyz = lidar_raw.reshape(-1, 5)[:, :3]
-
-    del lidar_raw
-    gc.collect()
+    lidar_xyz, lidar_boxes, io_ns = load_current_lidar_and_boxes_ego(nusc, sample_token)
+    if lidar_xyz.size == 0:
+        return FrameOverlayData(lidar_xyz=None, lidar_boxes=lidar_boxes, io_ns=io_ns)
     return FrameOverlayData(lidar_xyz=lidar_xyz, lidar_boxes=lidar_boxes, io_ns=io_ns)
 
 

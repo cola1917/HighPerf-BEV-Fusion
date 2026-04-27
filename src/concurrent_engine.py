@@ -14,6 +14,7 @@ import numpy as np
 from src.config import BEV_HEIGHT, BEV_WIDTH, CAMERA_NAMES, DATA_ROOT, RESOLUTION, VERSION, X_MAX, X_MIN, Y_MAX, Y_MIN
 from src.core.bev_utils import project_frame_to_bev
 from src.core.data_loader import NuscManager
+from src.core.sensor_alignment import load_current_lidar_and_boxes_ego
 
 
 def _physical_to_bev_pixel(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -199,13 +200,9 @@ async def run_pipeline() -> None:
     if lidar_token is None:
         raise RuntimeError("LIDAR_TOP not found in sample data.")
 
-    lidar_path, lidar_boxes, _ = nusc.get_sample_data(lidar_token)
-    lidar_raw = np.fromfile(lidar_path, dtype=np.float32)
-    if lidar_raw.size == 0 or lidar_raw.size % 5 != 0:
-        raise RuntimeError(f"Unexpected lidar data format in file: {lidar_path}")
+    lidar_xyz_ego, lidar_boxes, _ = load_current_lidar_and_boxes_ego(nusc, sample_token)
 
-    lidar_xyz = lidar_raw.reshape(-1, 5)[:, :3]
-    total_bev_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz)
+    total_bev_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz_ego)
     total_bev_lidar = overlay_bev_box_outlines(total_bev_lidar, lidar_boxes, alpha=0.25)
 
     output_final_path = "/app/output_total_bev_concurrent_lidar_box.jpg"
@@ -213,7 +210,7 @@ async def run_pipeline() -> None:
     cv2.imwrite(output_final_path, total_bev_lidar)
     print(f"Saved final concurrent BEV (with LIDAR + BOX) to: {output_final_path}")
 
-    del lidar_raw, lidar_xyz, lidar_boxes, total_bev_lidar
+    del lidar_xyz_ego, lidar_boxes, total_bev_lidar
     gc.collect()
 
     # Final cleanup for container memory friendliness.

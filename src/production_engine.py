@@ -19,6 +19,7 @@ import numpy as np
 from src.config import BEV_HEIGHT, BEV_WIDTH, CAMERA_NAMES, DATA_ROOT, RESOLUTION, VERSION, X_MAX, X_MIN, Y_MAX, Y_MIN
 from src.core.bev_utils import build_bev_remap_lut, fast_remap_kernel
 from src.core.data_loader import NuscManager
+from src.core.sensor_alignment import load_current_lidar_and_boxes_ego
 
 try:
     from turbojpeg import TJPF_BGR, TurboJPEG
@@ -157,27 +158,9 @@ def _worker_remap_to_shared_turbo(
         shm.close()
 
 
-def _load_lidar_xyz(nusc: Any, lidar_sample_data_token: str) -> tuple[np.ndarray, int]:
-    io_start = time.perf_counter_ns()
-    lidar_path = nusc.get_sample_data_path(lidar_sample_data_token)
-    raw = np.fromfile(lidar_path, dtype=np.float32)
-    io_ns = time.perf_counter_ns() - io_start
-    if raw.size == 0 or raw.size % 5 != 0:
-        return np.empty((0, 3), dtype=np.float32), io_ns
-    return raw.reshape(-1, 5)[:, :3], io_ns
-
-
 def _prepare_current_lidar_and_boxes(nusc: Any, sample_token: str) -> tuple[np.ndarray, list[object], int]:
     """Load current-frame lidar and boxes only (same logic as previous engines)."""
-    sample = nusc.get("sample", sample_token)
-    lidar_token = sample["data"].get("LIDAR_TOP")
-    if lidar_token is None:
-        return np.empty((0, 3), dtype=np.float32), [], 0
-
-    current_lidar_xyz, io_ns = _load_lidar_xyz(nusc, lidar_token)
-
-    _, boxes, _ = nusc.get_sample_data(lidar_token)
-    return current_lidar_xyz, boxes, io_ns
+    return load_current_lidar_and_boxes_ego(nusc, sample_token)
 
 
 def _box_category_color(category_name: str) -> tuple[int, int, int]:

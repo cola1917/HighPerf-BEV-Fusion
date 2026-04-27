@@ -29,6 +29,7 @@ from src.config import (
 )
 from src.core.bev_utils import build_bev_remap_lut, fast_remap_kernel
 from src.core.data_loader import NuscManager
+from src.core.sensor_alignment import load_current_lidar_and_boxes_ego
 
 
 LUT_CACHE_DIR = Path("/app/cache/ultimate_luts")
@@ -282,13 +283,9 @@ def main() -> None:
         if lidar_token is None:
             raise RuntimeError("LIDAR_TOP not found in sample data.")
 
-        lidar_path, lidar_boxes, _ = nusc.get_sample_data(lidar_token)
-        lidar_raw = np.fromfile(lidar_path, dtype=np.float32)
-        if lidar_raw.size == 0 or lidar_raw.size % 5 != 0:
-            raise RuntimeError(f"Unexpected lidar data format in file: {lidar_path}")
+        lidar_xyz_ego, lidar_boxes, _ = load_current_lidar_and_boxes_ego(nusc, sample_token)
 
-        lidar_xyz = lidar_raw.reshape(-1, 5)[:, :3]
-        total_bev_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz)
+        total_bev_lidar = overlay_lidar_on_bev(total_bev, lidar_xyz_ego)
         total_bev_lidar = overlay_bev_box_outlines(total_bev_lidar, lidar_boxes, alpha=0.25)
 
         os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
@@ -303,7 +300,7 @@ def main() -> None:
             f"total={time.perf_counter() - total_start:.3f}s"
         )
 
-        del lidar_raw, lidar_xyz, lidar_boxes, total_bev_lidar, total_bev, shared_array
+        del lidar_xyz_ego, lidar_boxes, total_bev_lidar, total_bev, shared_array
         gc.collect()
     finally:
         shm.close()
